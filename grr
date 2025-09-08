@@ -1,0 +1,149 @@
+# models/run_ann_b.py
+# Author: Oscar Arana
+
+"""
+Run cascaded inference:
+  1) ANN-A decides switch vs stay.
+  2) If switch, ANN-B selects the best target (LTE/WiFi).
+
+Usage:
+  python models/run_ann_b.py --snapshot-id 123
+"""
+
+import os, json, argparse, sys
+import numpy as np
+import pandas as pd
+import torch
+
+sys.path.append(r"C:\Users\cmr786\stuff\SmartSwitcher")
+from models.ann_a import ANNA
+from models.ann_b import ANNB
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+
+def load_model(model_class, model_path, meta_path, device):
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
+    hidden_layers = tuple(meta.get("hidden_layers", (128, 64)))
+    in_dim = len(meta["feature_cols"])
+    model = model_class(in_dim=in_dim, hidden=hidden_layers)
+    state = torch.load(model_path, map_location=device)
+    model.load_state_dict(state)
+    model.to(device).eval()
+    print(f"Loaded {model_class.__name__} with hidden={hidden_layers}")
+    return model, meta
+
+
+def get_snapshot_df(snapshot_id, candidates_csv, snapshots_csv, rag_csv=None):
+    cdf = pd.read_csv(candidates_csv)
+    sdf = pd.read_csv(snapshots_csv)[["snapshot_id", "current_network", "app_class", "hour", "weekday", "speed_mps"]]
+    g = cdf[cdf.snapshot_id == snapshot_id].merge(sdf, on="snapshot_id", how="left")
+    if g.empty or g["candidate_network"].nunique() < 2:
+        raise SystemExit(f"Snapshot {snapshot_id} does not have both LTE and WiFi rows")
+    if rag_csv and os.path.exists(rag_csv):
+        rdf = pd.read_csv(rag_csv)
+        g = g.merge(rdf, on=["snapshot_id", "candidate_network"], how="left")
+    return g
+
+
+def build_input_a(snap_df: pd.DataFrame, feature_cols_a: list) -> tuple[np.ndarray, str, str]:
+    # Current network comes from snapshots.csv merge
+    current_network = str(snap_df["current_network"].iloc[0])
+    target_network = "WiFi" if current_network == "LTE" else "LTE"
+
+    cur = snap_df[snap_df.candidate_network == current_network].iloc[0]
+    tgt = snap_df[snap_df.candidate_network == target_network].iloc[0]
+
+    # delta_* features expected by ANN-A meta
+    feat = {}
+    for c in feature_cols_a:
+        if c.startswith("delta_"):
+            base = c.replace("delta_", "")
+            if base in snap_df.columns:
+                feat[c] = float(tgt[base]) - float(cur[base])
+            else:
+                feat[c] = 0.0
+        elif c == "switch_outage_ms":
+            # Penalty to switch TO the target
+            feat[c] = float(tgt.get("switch_outage_ms", 0.0))
+        else:
+            # Any extra scalars in meta → best-effort fill
+            feat[c] = float(tgt.get(c, 0.0))
+
+    x = np.array([feat[c] for c in feature_cols_a], dtype=np.float32)
+    return x, current_network, target_network
+
+
+def build_input_b(snap_df: pd.DataFrame, feature_cols_b: list, candidate_order: list[str]) -> tuple[np.ndarray, list[str]]:
+    # Ensure columns exist; missing features are filled with 0
+    for col in feature_cols_b:
+        if col not in snap_df.columns:
+            snap_df[col] = 0.0
+
+    order_map = {c: i for i, c in enumerate(candidate_order)}
+    g = snap_df[snap_df.candidate_network.isin(candidate_order)].sort_values(
+        "candidate_network", key=lambda s: s.map(order_map)
+    )
+    X = g[feature_cols_b].to_numpy(dtype=np.float32)  # [2, D]
+    names = list(g["candidate_network"].values)
+    return X, names
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Run cascaded ANN-A → ANN-B inference.")
+    ap.add_argument("--candidates", default="data/candidates.csv")
+    ap.add_argument("--snapshots",  default="data/snapshots.csv")
+    ap.add_argument("--rag",        default="data/rag_features.csv")
+    ap.add_argument("--model-a",    default="data/ANN-A/ann_a.pt")
+    ap.add_argument("--meta-a",     default="data/ANN-A/ann_a_meta.json")
+    ap.add_argument("--model-b",    default="data/ANN-B/ann_b.pt")
+    ap.add_argument("--meta-b",     default="data/ANN-B/ann_b_meta.json")
+    ap.add_argument("--snapshot-id", type=int, required=True)
+    ap.add_argument("--threshold",   type=float, default=0.5, help="ANN-A probability to trigger switching.")
+    args = ap.parse_args()
+
+    # Load snapshot/candidate slice
+    snap_df = get_snapshot_df(args.snapshot_id, args.candidates, args.snapshots, args.rag)
+
+    # ---- Step 1: ANN-A (gate) ----
+    print("\n--- Step 1: ANN-A (switch vs stay) ---")
+    model_a, meta_a = load_model(ANNA, args.model_a, args.meta_a, device)
+    xa, cur_net, tgt_net = build_input_a(snap_df, meta_a["feature_cols"])
+    mean_a = np.array(meta_a["mean"], dtype=np.float32)
+    std_a  = np.array(meta_a["std"], dtype=np.float32)
+    xa_n = (xa - mean_a) / (std_a + 1e-6)
+    with torch.no_grad():
+        logit = model_a(torch.from_numpy(xa_n[None, :]).to(device))
+        p_switch = torch.sigmoid(logit).item()
+    print(f"Current={cur_net}, TargetCandidate={tgt_net}, P(switch)={p_switch:.4f} (thr={args.threshold})")
+
+    if p_switch < args.threshold:
+        print("\nDecision: NO SWITCH (staying on current network).")
+        return
+
+    # ---- Step 2: ANN-B (selector) ----
+    print("\n--- Step 2: ANN-B (choose best target) ---")
+    model_b, meta_b = load_model(ANNB, args.model_b, args.meta_b, device)
+    # ANN-B should not include any penalty columns; use meta_b["feature_cols"] as saved during training
+    Xb, names = build_input_b(snap_df, meta_b["feature_cols"], meta_b.get("candidate_order", ["LTE", "WiFi"]))
+    mean_b = np.array(meta_b["mean"], dtype=np.float32)
+    std_b  = np.array(meta_b["std"], dtype=np.float32)
+    Xb_n = (Xb - mean_b) / (std_b + 1e-6)
+    xt = torch.from_numpy(Xb_n[None, :, :]).to(device)
+
+    with torch.no_grad():
+        probs, logits = model_b(xt)
+        p = probs.squeeze(0).detach().cpu().numpy()
+        s = logits.squeeze(0).detach().cpu().numpy()
+    choice = int(p.argmax())
+
+    print("\nProbabilities:")
+    for i, n in enumerate(names):
+        print(f"  {n:5s}  prob={p[i]:.4f}  logit={s[i]:.3f}")
+    print(f"\nFinal recommendation: SWITCH to {names[choice]}")
+
+
+if __name__ == "__main__":
+    main()
