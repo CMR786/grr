@@ -1,149 +1,1017 @@
-# models/run_ann_b.py
-# Author: Oscar Arana
+# app.py
+# Demo: Live Network Utility App (LTE / WiFi / LMR) with FAISS + ANN-A/ANN-B
+# Author: You (based on assistant scaffolding)
 
-"""
-Run cascaded inference:
-  1) ANN-A decides switch vs stay.
-  2) If switch, ANN-B selects the best target (LTE/WiFi).
+import math
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import List, Tuple, Optional
 
-Usage:
-  python models/run_ann_b.py --snapshot-id 123
-"""
-
-import os, json, argparse, sys
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
+import streamlit as st
 
-sys.path.append(r"C:\Users\cmr786\stuff\SmartSwitcher")
-from models.ann_a import ANNA
-from models.ann_b import ANNB
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
-
-
-def load_model(model_class, model_path, meta_path, device):
-    with open(meta_path, "r") as f:
-        meta = json.load(f)
-    hidden_layers = tuple(meta.get("hidden_layers", (128, 64)))
-    in_dim = len(meta["feature_cols"])
-    model = model_class(in_dim=in_dim, hidden=hidden_layers)
-    state = torch.load(model_path, map_location=device)
-    model.load_state_dict(state)
-    model.to(device).eval()
-    print(f"Loaded {model_class.__name__} with hidden={hidden_layers}")
-    return model, meta
+# ---------- Optional FAISS, fallback to NumPy kNN ----------
+try:
+    import faiss  # pip install faiss-cpu
+    HAVE_FAISS = True
+except Exception:
+    faiss = None
+    HAVE_FAISS = False
 
 
-def get_snapshot_df(snapshot_id, candidates_csv, snapshots_csv, rag_csv=None):
-    cdf = pd.read_csv(candidates_csv)
-    sdf = pd.read_csv(snapshots_csv)[["snapshot_id", "current_network", "app_class", "hour", "weekday", "speed_mps"]]
-    g = cdf[cdf.snapshot_id == snapshot_id].merge(sdf, on="snapshot_id", how="left")
-    if g.empty or g["candidate_network"].nunique() < 2:
-        raise SystemExit(f"Snapshot {snapshot_id} does not have both LTE and WiFi rows")
-    if rag_csv and os.path.exists(rag_csv):
-        rdf = pd.read_csv(rag_csv)
-        g = g.merge(rdf, on=["snapshot_id", "candidate_network"], how="left")
-    return g
+# =========================
+# UI CONFIG / THEME
+# =========================
+st.set_page_config(
+    page_title="Smart Switcher Demo",
+    page_icon="📶",
+    layout="wide",
+)
+
+HIDE_DEFAULT_STYLE = """
+<style>
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+.block-container {padding-top: 1rem; padding-bottom: 2rem;}
+.big-metric {font-size: 1.8rem; font-weight:700;}
+.small-muted {color:#6b7280; font-size:0.9rem;}
+.card {
+  border-radius: 16px; padding:16px; border:1px solid #e5e7eb; background: #ffffff;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+}
+.badge {display:inline-block; padding:4px 10px; border-radius:9999px; background:#eef2ff; color:#3730a3; font-weight:600;}
+.kpill {display:inline-block; padding:4px 10px; border-radius:8px; background:#f1f5f9; margin-right:6px;}
+table td, table th {font-size:0.9rem;}
+</style>
+"""
+st.markdown(HIDE_DEFAULT_STYLE, unsafe_allow_html=True)
 
 
-def build_input_a(snap_df: pd.DataFrame, feature_cols_a: list) -> tuple[np.ndarray, str, str]:
-    # Current network comes from snapshots.csv merge
-    current_network = str(snap_df["current_network"].iloc[0])
-    target_network = "WiFi" if current_network == "LTE" else "LTE"
+# =========================
+# CONFIG & SYNTHETIC GEN
+# =========================
+@dataclass
+class GenConfig:
+    n_snapshots: int = 10_000            # cap used for buffer, we stream indefinitely
+    step_seconds: int = 3
+    seed: int = 42
+    center_lat: float = 25.7617
+    center_lon: float = -80.1918
+    radius_km: float = 8.0
+    candidates: tuple = ("LTE", "WiFi", "LMR")
+    # policy / labels
+    switch_margin: float = 0.012
+    switch_penalty_scale: float = 0.55
+    current_choice_tau: float = 0.35
+    p_suboptimal_current: float = 0.45
+    # RAG
+    knn_k: int = 50
 
-    cur = snap_df[snap_df.candidate_network == current_network].iloc[0]
-    tgt = snap_df[snap_df.candidate_network == target_network].iloc[0]
+APP_CLASSES = ["voip", "map", "bg"]
+APP_PROBS = [0.15, 0.35, 0.50]
 
-    # delta_* features expected by ANN-A meta
+
+def device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def rng(cfg: GenConfig):
+    return np.random.default_rng(cfg.seed if "seed" in cfg.__dict__ else 42)
+
+
+def _sample_geo(cfg: GenConfig, n: int) -> Tuple[np.ndarray, np.ndarray]:
+    lat0, lon0 = cfg.center_lat, cfg.center_lon
+    R = cfg.radius_km / 111.0
+    r = rng(cfg)
+    angles = r.uniform(0, 2 * np.pi, n)
+    radii = np.sqrt(r.uniform(0, 1, n)) * R
+    dlat = radii * np.cos(angles)
+    dlon = radii * np.sin(angles) / np.cos(np.deg2rad(lat0))
+    return lat0 + dlat, lon0 + dlon
+
+
+def _rtt(tech, load, speed_mps, r):
+    base = 30 if tech == "LTE" else (20 if tech == "WiFi" else 220)
+    mot = 0.05 * speed_mps
+    jitter = r.normal(0, 3)
+    return max(5.0, base * (1 + 0.8 * load) + mot + jitter)
+
+
+def _jitter(rtt, r) -> float:
+    return float(max(1.0, 0.15 * rtt + abs(r.normal(0, 2))))
+
+
+def _loss_from_bler(bler, r) -> float:
+    return float(max(0.0, min(0.3, 0.6 * bler + max(0, r.normal(0, 0.01)))))
+
+
+def _capacity_from_sinr(sinr_db, bw_mhz) -> float:
+    sinr_lin = 10 ** (sinr_db / 10)
+    eff_bphz = np.log2(1 + sinr_lin)
+    return float(eff_bphz * (bw_mhz * 1e6) / 1e6)
+
+
+def _wifi_rate(snr_db, bw_mhz) -> float:
+    base = (np.log1p(max(snr_db, -5) + 6) / np.log1p(50))
+    max_rate = {20: 150, 40: 300, 80: 650, 160: 1200}.get(int(bw_mhz), 150)
+    return float(base * max_rate)
+
+
+def _denial_prob(access_denials_5m, last_denial_s, load):
+    p = 0.01 + 0.02 * access_denials_5m + 0.0005 * max(0, 600 - last_denial_s) + 0.3 * max(0, load - 0.8)
+    return float(min(0.35, p))
+
+
+def _energy_per_mb(tech, rssi_or_rsrp):
+    base = {"LTE": 0.35, "WiFi": 0.18, "LMR": 0.22}.get(tech, 0.35)
+    th = {"LTE": -95, "WiFi": -70, "LMR": -90}.get(tech, -90)
+    weak_pen = 0.0
+    if rssi_or_rsrp < th:
+        weak_pen = min(0.25, (th - rssi_or_rsrp) * 0.004)
+    return base + weak_pen
+
+
+def _switch_outage(current, target, r):
+    if current == target:
+        base = 450.0
+    else:
+        PAIR_BASE = {
+            ("LTE", "WiFi"): 1500, ("WiFi", "LTE"): 1500,
+            ("LTE", "LMR"): 2000, ("LMR", "LTE"): 2000,
+            ("WiFi", "LMR"): 1800, ("LMR", "WiFi"): 1800,
+        }
+        base = PAIR_BASE.get((current, target), 1600)
+    return float(max(150.0, r.normal(base, base * 0.25)))
+
+
+def _utility(tput_mbps, rtt_ms, jitter_ms, loss, energy_mwh_per_mb, cost_per_mb, switch_outage_ms=0.0):
+    w_tput, w_rtt, w_jit, w_loss, w_energy, w_cost, w_sw = 1.0, 0.8, 0.3, 1.2, 0.3, 0.2, 0.0015
+    nt = np.tanh(tput_mbps / 100.0)
+    nr = 1 - np.tanh(max(5.0, rtt_ms) / 150.0)
+    nj = 1 - np.tanh(jitter_ms / 100.0)
+    nl = 1 - min(0.3, loss) / 0.3
+    ne = 1 - np.tanh(energy_mwh_per_mb / 1.2)
+    nc = 1 - np.tanh(cost_per_mb / 0.05)
+    ns = 1 - np.tanh(switch_outage_ms / 1500.0)
+    return (w_tput * nt + w_rtt * nr + w_jit * nj + w_loss * nl + w_energy * ne + w_cost * nc + w_sw * ns)
+
+
+# =========================
+# MODELS
+# =========================
+class GateANNA(nn.Module):
+    """ANN-A: outputs logit for P(switch_now) given delta features + switch_outage_ms."""
+    def __init__(self, in_dim: int, hidden=(128, 64), pdrop=0.1):
+        super().__init__()
+        layers = []
+        d = in_dim
+        for h in hidden:
+            layers += [nn.Linear(d, h), nn.ReLU(), nn.BatchNorm1d(h), nn.Dropout(pdrop)]
+            d = h
+        layers += [nn.Linear(d, 1)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):  # x: [B, D]
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+        return self.net(x).squeeze(-1)  # [B]
+
+
+class SelectorANNB(nn.Module):
+    """Shared per-candidate tower. Input X [B, N, D] → logits [B,N], softmax → probs."""
+    def __init__(self, in_dim: int, hidden=(128, 64), pdrop=0.1):
+        super().__init__()
+        layers = []
+        d = in_dim
+        for h in hidden:
+            layers += [nn.Linear(d, h), nn.ReLU(), nn.BatchNorm1d(h), nn.Dropout(pdrop)]
+            d = h
+        layers += [nn.Linear(d, 1)]
+        self.tower = nn.Sequential(*layers)
+
+    def forward(self, X):  # X: [B, N, D]
+        X = torch.nan_to_num(X, nan=0.0, posinf=1e6, neginf=-1e6)
+        B, N, D = X.shape
+        s = self.tower(X.reshape(B * N, D)).reshape(B, N)  # logits
+        p = torch.softmax(s, dim=1)
+        return p, s
+
+
+# =========================
+# FAISS WRAPPER
+# =========================
+class VecIndex:
+    """FAISS L2 index with numpy fallback. We also track (row_idx) for retrieval."""
+    def __init__(self, dim: int):
+        self.dim = dim
+        self.ids: List[int] = []
+        self.vectors: List[np.ndarray] = []
+        if HAVE_FAISS:
+            self.index = faiss.IndexFlatL2(dim)
+        else:
+            self.index = None
+
+    def add(self, vecs: np.ndarray, ids: List[int]):
+        assert vecs.shape[1] == self.dim
+        self.vectors.extend([v for v in vecs.astype(np.float32)])
+        self.ids.extend(ids)
+        if HAVE_FAISS:
+            self.index.add(vecs.astype(np.float32))
+
+    def search(self, qvecs: np.ndarray, k: int):
+        q = qvecs.astype(np.float32)
+        if HAVE_FAISS and len(self.ids) >= k:
+            D, I = self.index.search(q, k)
+            mapped = np.vectorize(lambda i: self.ids[i] if i >= 0 and i < len(self.ids) else -1)(I)
+            return D, mapped
+        # fallback: brute force
+        X = np.stack(self.vectors) if self.vectors else np.zeros((0, self.dim), dtype=np.float32)
+        if len(X) == 0:
+            return np.zeros((len(q), k), dtype=np.float32), -np.ones((len(q), k), dtype=int)
+        # L2 dist
+        D = ((q[:, None, :] - X[None, :, :]) ** 2).sum(axis=2)
+        I = np.argsort(D, axis=1)[:, :k]
+        mapped = np.vectorize(lambda i: self.ids[i])(I)
+        D_sorted = np.take_along_axis(D, I, axis=1)
+        return D_sorted, mapped
+
+
+# =========================
+# FEATURE LISTS
+# =========================
+NUMERIC_COLS_ANNB = [
+    "tput_dl_mbps", "tput_ul_mbps", "rtt_ms", "jitter_ms", "loss_rate",
+    "p_denial", "energy_mwh_per_mb", "cost_per_mb", "ambient_load",
+    "rsrp_dbm", "rsrq_db", "sinr_db", "rssi_dbm", "snr_db",
+    "hour", "weekday", "speed_mps",
+    "knn_tput_p50", "knn_tput_p90", "knn_rtt_p90", "knn_loss_mean", "knn_p_denial_mean", "knn_avail_rate",
+]
+APP_ONEHOTS = ["app_bg", "app_map", "app_voip"]  # deterministic order for ANN-B
+
+BASE_DELTA_COLS_ANNA = [
+    "tput_dl_mbps", "rtt_ms", "jitter_ms", "loss_rate",
+    "p_denial", "energy_mwh_per_mb", "cost_per_mb",
+]
+RAG_DELTA_COLS_ANNA = ["knn_tput_p50", "knn_tput_p90", "knn_rtt_p90", "knn_loss_mean", "knn_p_denial_mean"]
+EXTRA_SCALARS_ANNA = ["switch_outage_ms"]
+
+
+# =========================
+# STREAMING / STATE
+# =========================
+def init_state():
+    if "cfg" not in st.session_state:
+        st.session_state.cfg = GenConfig()
+    if "sid" not in st.session_state:
+        st.session_state.sid = 0
+    if "snapshots" not in st.session_state:
+        st.session_state.snapshots = pd.DataFrame(columns=[
+            "snapshot_id","timestamp","lat","lon","geo_bucket","speed_mps","heading_deg",
+            "weekday","hour","app_class","battery_pct","current_network"
+        ])
+    if "candidates" not in st.session_state:
+        st.session_state.candidates = pd.DataFrame(columns=[
+            "snapshot_id","candidate_network","available","ambient_load",
+            "rsrp_dbm","rsrq_db","sinr_db","rssi_dbm","snr_db","ber","bler","band","chan_bw_mhz",
+            "access_denials_5m","last_denial_s","p_denial",
+            "tput_dl_mbps","tput_ul_mbps","rtt_ms","jitter_ms","loss_rate",
+            "energy_mwh_per_mb","cost_per_mb",
+            "switch_outage_ms","standalone_utility","net_utility",
+            "label_best_network","label_best_net_utility","label_switch_now"
+        ])
+    if "emb" not in st.session_state:
+        st.session_state.emb = pd.DataFrame(columns=["snapshot_id","candidate_network"])
+    if "vec" not in st.session_state:
+        st.session_state.vec = None
+    if "model_a" not in st.session_state:
+        st.session_state.model_a = None
+    if "meta_a" not in st.session_state:
+        st.session_state.meta_a = None
+    if "model_b" not in st.session_state:
+        st.session_state.model_b = None
+    if "meta_b" not in st.session_state:
+        st.session_state.meta_b = None
+    if "running" not in st.session_state:
+        st.session_state.running = False
+    if "log" not in st.session_state:
+        st.session_state.log = []
+
+
+# =========================
+# GENERATE ONE SNAPSHOT
+# =========================
+def gen_one(cfg: GenConfig, sid: int):
+    r = rng(cfg)
+    # context
+    ts = datetime.utcnow() + timedelta(seconds=sid * cfg.step_seconds)
+    lat, lon = _sample_geo(cfg, 1)
+    speed = float(np.clip(r.normal(6, 4), 0, 40))
+    heading = float(r.uniform(0, 360))
+    app = str(r.choice(APP_CLASSES, p=APP_PROBS))
+    battery = int(np.clip(r.normal(65, 22), 5, 100))
+
+    snap = {
+        "snapshot_id": sid,
+        "timestamp": ts.isoformat(timespec="seconds"),
+        "lat": float(lat[0]),
+        "lon": float(lon[0]),
+        "geo_bucket": f"{(math.floor(lat[0]/0.01)*0.01):.2f}_{(math.floor(lon[0]/0.01)*0.01):.2f}",
+        "speed_mps": speed,
+        "heading_deg": heading,
+        "weekday": ts.weekday(),
+        "hour": ts.hour,
+        "app_class": app,
+        "battery_pct": battery,
+    }
+
+    # candidates
+    rows = []
+    ambient_load = float(np.clip(r.beta(2, 5) + 0.1 * (app == "map"), 0, 1))
+    wifi_available = r.random() < (0.60 if ambient_load < 0.6 else 0.40)
+
+    for tech in cfg.candidates:
+        available = 1
+        if tech == "WiFi" and not wifi_available:
+            available = 0
+
+        # RF + link params
+        if tech == "LTE":
+            rsrp = r.normal(-92, 8)
+            rsrq = r.normal(-10.5, 2.5)
+            sinr = r.normal(9, 6)
+            ber = max(0.0, min(0.2, 0.02 + 0.002 * (10 - sinr) + abs(r.normal(0, 0.01))))
+            bler = max(0.0, min(0.3, 0.04 + 0.01 * (5 - sinr / 3) + abs(r.normal(0, 0.02))))
+            band = int(r.choice([3, 7, 28, 41, 66]))
+            bw = float(r.choice([10, 15, 20]))
+            rssi = np.nan
+            snr = np.nan
+        elif tech == "WiFi":
+            rssi = r.normal(-58, 8)
+            snr = r.normal(28, 7)
+            rsrp = rsrq = np.nan
+            sinr = snr - 3
+            ber = max(0.0, min(0.15, 0.01 + 0.003 * (18 - snr) + abs(r.normal(0, 0.01))))
+            bler = max(0.0, min(0.20, 0.02 + 0.006 * (15 - snr) + abs(r.normal(0, 0.02))))
+            band = int(r.choice([2, 5, 6]))
+            bw = float(r.choice([20, 40, 80]))
+        else:  # LMR
+            available = 1 if r.random() < 0.60 else 0
+            rssi = float(r.normal(-96, 6))
+            snr = float(np.clip(r.normal(9, 4), 0, 20))
+            rsrp = rsrq = sinr = np.nan
+            ber = max(0.0, min(0.20, 0.03 + 0.004 * (15 - snr) + abs(r.normal(0, 0.02))))
+            bler = max(0.0, min(0.25, 0.05 + 0.006 * (12 - snr) + abs(r.normal(0, 0.02))))
+            band = int(r.choice([450, 700, 800]))
+            bw = 0.0125  # MHz
+
+        # performance
+        if tech == "WiFi":
+            tput_dl = max(0.5, _wifi_rate(float(snr) if np.isfinite(snr) else 15.0, bw) * (1 - 0.6 * ambient_load) + r.normal(0, 10))
+            tput_ul = max(0.2, 0.6 * tput_dl + r.normal(0, 6))
+        elif tech == "LTE":
+            cap = max(5.0, _capacity_from_sinr(float(sinr) if np.isfinite(sinr) else 5.0, bw))
+            tput_dl = max(1.0, cap * 0.55 * (1 - 0.5 * ambient_load) + r.normal(0, 8))
+            tput_ul = max(0.5, 0.5 * tput_dl + r.normal(0, 4))
+        else:
+            tput_dl = float(np.clip(r.normal(0.10, 0.06), 0.01, 0.35))
+            tput_ul = float(np.clip(r.normal(0.08, 0.05), 0.005, 0.25))
+
+        rtt = _rtt(tech, ambient_load, snap["speed_mps"], r)
+        jitter = _jitter(rtt, r)
+        loss = _loss_from_bler(float(bler), r)
+
+        rssi_or_rsrp = float(rssi) if tech in ("WiFi", "LMR") else float(rsrp)
+        if not np.isfinite(rssi_or_rsrp):
+            rssi_or_rsrp = -95.0
+
+        energy = _energy_per_mb(tech, rssi_or_rsrp)
+        cost_per_mb = {"LTE": 0.004, "WiFi": 0.0005, "LMR": 0.0002}.get(tech, 0.004)
+
+        util = _utility(tput_dl, rtt, jitter, loss, energy, cost_per_mb, 0.0)
+
+        rows.append({
+            "snapshot_id": sid,
+            "candidate_network": tech,
+            "available": int(available),
+            "ambient_load": float(ambient_load),
+            "rsrp_dbm": float(rsrp) if np.isfinite(rsrp) else "",
+            "rsrq_db": float(rsrq) if np.isfinite(rsrq) else "",
+            "sinr_db": float(sinr) if np.isfinite(sinr) else "",
+            "rssi_dbm": float(rssi) if np.isfinite(rssi) else "",
+            "snr_db": float(snr) if np.isfinite(snr) else "",
+            "ber": float(ber),
+            "bler": float(bler),
+            "band": int(band),
+            "chan_bw_mhz": float(bw),
+            "access_denials_5m": int(int(np.clip(r.poisson(0.08 + 0.35 * ambient_load), 0, 99))),
+            "last_denial_s": int(r.integers(30, 1200)),
+            "p_denial": float(_denial_prob(int(np.clip(r.poisson(0.08 + 0.35 * ambient_load), 0, 99)), int(r.integers(30, 1200)), ambient_load)),
+            "tput_dl_mbps": float(tput_dl),
+            "tput_ul_mbps": float(tput_ul),
+            "rtt_ms": float(rtt),
+            "jitter_ms": float(jitter),
+            "loss_rate": float(loss),
+            "energy_mwh_per_mb": float(energy),
+            "cost_per_mb": float(cost_per_mb),
+            "standalone_utility": float(util),
+        })
+
+    cand = pd.DataFrame(rows)
+
+    # pick current network (noisy best available)
+    def _softmax(x, tau):
+        x = np.array(x, dtype=float)
+        x = (x - x.max()) / max(1e-9, tau)
+        ex = np.exp(x)
+        return ex / (ex.sum() + 1e-9)
+
+    sub = cand[cand.available == 1]
+    if len(sub) == 0:
+        current = "WiFi"
+    else:
+        util = sub["standalone_utility"].to_numpy()
+        probs = _softmax(util, st.session_state.cfg.current_choice_tau)
+        if rng(st.session_state.cfg).random() < st.session_state.cfg.p_suboptimal_current:
+            current = str(sub.iloc[np.random.choice(len(sub), p=probs)]["candidate_network"])
+        else:
+            current = str(sub.iloc[int(np.argmax(util))]["candidate_network"])
+
+    snap["current_network"] = current
+
+    # add switch outage & net utility
+    def _swpen(cur, cand_net):
+        if cand_net == cur:
+            return 0.0
+        raw = _switch_outage(cur, cand_net, r)
+        return float(max(0.0, raw * st.session_state.cfg.switch_penalty_scale))
+
+    cand["switch_outage_ms"] = [ _swpen(current, n) for n in cand["candidate_network"].tolist() ]
+    cand["net_utility"] = [
+        _utility(row.tput_dl_mbps, row.rtt_ms, row.jitter_ms, row.loss_rate,
+                 row.energy_mwh_per_mb, row.cost_per_mb, row.switch_outage_ms)
+        for _, row in cand.iterrows()
+    ]
+
+    # label best
+    avail = cand[cand["available"] == 1]
+    if len(avail) == 0:
+        best_row = cand.iloc[0]
+    else:
+        best_row = avail.sort_values("net_utility", ascending=False).iloc[0]
+
+    best_net = str(best_row["candidate_network"])
+    best_util = float(best_row["net_utility"])
+
+    # label switch_now per candidate
+    cur_util = float(cand[cand["candidate_network"] == current]["net_utility"].iloc[0])
+    cand["label_best_network"] = best_net
+    cand["label_best_net_utility"] = best_util
+    cand["label_switch_now"] = [
+        int((n != current) and (u - cur_util) > st.session_state.cfg.switch_margin)
+        for n, u in zip(cand["candidate_network"], cand["net_utility"])
+    ]
+    return pd.DataFrame([snap]), cand
+
+
+# =========================
+# EMBEDDINGS + RAG
+# =========================
+def build_embedding_rows(cand_df: pd.DataFrame, snap_df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["rsrp_dbm","rsrq_db","sinr_db","rssi_dbm","snr_db","hour","weekday","speed_mps"]
+    df = cand_df.merge(snap_df[["snapshot_id","hour","weekday","speed_mps"]], on="snapshot_id", how="left")
+    # numeric coerce
+    mat = []
+    for c in cols:
+        mat.append(pd.to_numeric(df[c], errors="coerce").fillna(0.0).astype(float))
+    X = np.vstack(mat).T
+    X_norm = (X - X.mean(axis=0)) / (X.std(axis=0) + 1e-6)
+    Z = np.hstack([X_norm, np.tanh(X_norm)])  # simple nonlinearity
+    emb_cols = [f"e({i})" for i in range(Z.shape[1])]
+    out = pd.DataFrame(Z, columns=emb_cols)
+    out.insert(0, "candidate_network", df["candidate_network"].values)
+    out.insert(0, "snapshot_id", df["snapshot_id"].values)
+    return out
+
+
+def ensure_vector_index(dim: int):
+    if st.session_state.vec is None:
+        st.session_state.vec = VecIndex(dim)
+
+
+def add_embeddings_to_index(emb_rows: pd.DataFrame):
+    # build unique IDs for each row appended
+    start_id = len(st.session_state.emb)
+    ids = list(range(start_id, start_id + len(emb_rows)))
+    ensure_vector_index(len([c for c in emb_rows.columns if c.startswith("e(")]))
+    vecs = emb_rows.filter(regex=r"^e\(").to_numpy(dtype=np.float32)
+    st.session_state.vec.add(vecs, ids)
+    # persist emb rows with ids
+    emb_rows = emb_rows.copy()
+    emb_rows["emb_id"] = ids
+    st.session_state.emb = pd.concat([st.session_state.emb, emb_rows], ignore_index=True)
+
+
+def rag_for_rows(new_rows: pd.DataFrame, K: int) -> pd.DataFrame:
+    """Compute kNN aggregates for the provided candidate rows using the full index."""
+    if st.session_state.vec is None or len(st.session_state.emb) == 0:
+        # cold start zeros
+        zeros = dict(
+            knn_tput_p50=0.0, knn_tput_p90=0.0, knn_rtt_p90=0.0,
+            knn_loss_mean=0.0, knn_p_denial_mean=0.0, knn_avail_rate=0.0
+        )
+        for k, v in zeros.items():
+            new_rows[k] = v
+        return new_rows
+
+    embs = build_embedding_rows(new_rows, st.session_state.snapshots)
+    qvecs = embs.filter(regex=r"^e\(").to_numpy(dtype=np.float32)
+    D, I = st.session_state.vec.search(qvecs, max(1, K))
+    # Map neighbor emb_id → candidate row
+    emb = st.session_state.emb
+    cand_all = st.session_state.candidates
+
+    agg_cols = []
+    for i in range(len(new_rows)):
+        nbr_ids = I[i]
+        nbr_ids = [nid for nid in nbr_ids if nid != -1]
+        if not nbr_ids:
+            # zeros
+            agg_cols.append((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+            continue
+        nbr_rows = emb[emb["emb_id"].isin(nbr_ids)][["snapshot_id","candidate_network"]]
+        nbr_df = nbr_rows.merge(cand_all, on=["snapshot_id","candidate_network"], how="left")
+        # Remove neighbors from the same snapshot to avoid trivial leakage
+        nbr_df = nbr_df[nbr_df["snapshot_id"] != new_rows.iloc[i]["snapshot_id"]]
+        if len(nbr_df) == 0:
+            agg_cols.append((0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+            continue
+        k_tput_p50 = float(nbr_df["tput_dl_mbps"].median())
+        k_tput_p90 = float(nbr_df["tput_dl_mbps"].quantile(0.90))
+        k_rtt_p90  = float(nbr_df["rtt_ms"].quantile(0.90))
+        k_loss_m   = float(nbr_df["loss_rate"].mean())
+        k_pdeny_m  = float(nbr_df["p_denial"].mean())
+        k_avail    = float(nbr_df["available"].mean())
+        agg_cols.append((k_tput_p50, k_tput_p90, k_rtt_p90, k_loss_m, k_pdeny_m, k_avail))
+
+    new_rows = new_rows.copy()
+    cols = ["knn_tput_p50","knn_tput_p90","knn_rtt_p90","knn_loss_mean","knn_p_denial_mean","knn_avail_rate"]
+    for ci, c in enumerate(cols):
+        new_rows[c] = [t[ci] for t in agg_cols]
+    return new_rows
+
+
+# =========================
+# TRAINING
+# =========================
+def train_annb(cdf: pd.DataFrame, sdf: pd.DataFrame, device_: torch.device):
+    # Build features + labels (gate-positive only; label = best alternative by standalone_utility)
+    CAND_ORDER = list(st.session_state.cfg.candidates)
+    df = cdf.merge(sdf[["snapshot_id","current_network","app_class","hour","weekday","speed_mps"]], on="snapshot_id", how="left").copy()
+
+    # require at least two candidates present
+    keep = df.groupby("snapshot_id")["candidate_network"].nunique() >= 2
+    df = df[df["snapshot_id"].isin(keep[keep].index)]
+
+    # add app one-hots
+    for a in ["bg","map","voip"]:
+        df[f"app_{a}"] = (df["app_class"] == a).astype(np.float32)
+
+    # gate-positive filter based on net_utility (consistent with run-time gate)
+    best = (df[df["available"] == 1]
+            .sort_values(["snapshot_id","net_utility"], ascending=[True, False])
+            .groupby("snapshot_id")
+            .head(1)[["snapshot_id","candidate_network","net_utility"]]
+            .rename(columns={"candidate_network":"best_net","net_utility":"best_u"}))
+    cur_util = df[df["candidate_network"] == df["current_network"]][["snapshot_id","net_utility"]].rename(columns={"net_utility":"cur_u"})
+    mark = best.merge(cur_util, on="snapshot_id", how="left")
+    mark["gate_pos"] = (mark["best_u"] - mark["cur_u"]) > st.session_state.cfg.switch_margin
+    df = df[df["snapshot_id"].isin(mark[mark["gate_pos"]]["snapshot_id"].unique())]
+
+    # build per-snapshot tensors
+    fcols = NUMERIC_COLS_ANNB + APP_ONEHOTS
+    for col in NUMERIC_COLS_ANNB:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0).astype(np.float32)
+
+    X_list, y_list = [], []
+    sids = []
+    for sid, g in df.groupby("snapshot_id", sort=False):
+        cur = str(g["current_network"].iloc[0])
+        # label = best alternative by standalone_utility (available != current)
+        alt = g[(g["candidate_network"] != cur) & (g["available"] == 1)]
+        if len(alt) == 0:
+            continue
+        best_alt = str(alt.sort_values("standalone_utility", ascending=False).iloc[0]["candidate_network"])
+
+        # make sure app_* exist
+        for a in ["bg","map","voip"]:
+            g[f"app_{a}"] = (g["app_class"] == a).astype(np.float32)
+
+        # candidate order present subset
+        g = g[g["candidate_network"].isin(CAND_ORDER)].copy()
+        # absolute features
+        X_abs = g[fcols].to_numpy(dtype=np.float32)
+        # delta-to-current augmentation
+        cur_row = g[g["candidate_network"] == cur]
+        if len(cur_row) == 0:
+            # if current not in subset, skip
+            continue
+        cur_vec = cur_row[fcols].iloc[0].to_numpy(dtype=np.float32)
+        X_delta = X_abs - cur_vec
+        Xi = np.concatenate([X_abs, X_delta], axis=1)  # [N, 2D]
+        # sort by candidate order for stability
+        order = {c:i for i,c in enumerate(CAND_ORDER)}
+        order_idx = np.argsort([order[c] for c in g["candidate_network"].tolist()])
+        Xi = Xi[order_idx]
+        y = CAND_ORDER.index(best_alt)
+
+        X_list.append(Xi)
+        y_list.append(y)
+        sids.append(int(sid))
+
+    if not X_list:
+        raise RuntimeError("No training samples for ANN-B (gate-positive set empty).")
+
+    X = np.stack(X_list, axis=0)  # [B, N, 2D]
+    y = np.array(y_list, dtype=np.int64)
+    B, N, D2 = X.shape
+    D = D2 // 2  # original feature dim
+    # normalize on train only
+    idx = np.arange(B); np.random.shuffle(idx)
+    n_val = max(1, int(0.15 * B))
+    val_idx = idx[:n_val]; tr_idx = idx[n_val:]
+    def norm_pack(X_):
+        B_, N_, D2_ = X_.shape
+        Xf = X_.reshape(B_*N_, D2_)
+        mean = Xf.mean(axis=0); std = Xf.std(axis=0) + 1e-6
+        return mean, std
+    mean, std = norm_pack(X[tr_idx])
+    Xtr = ((X[tr_idx] - mean) / std).astype(np.float32)
+    Xva = ((X[val_idx] - mean) / std).astype(np.float32)
+
+    tr_ds = torch.utils.data.TensorDataset(torch.from_numpy(Xtr), torch.from_numpy(y[tr_idx]))
+    va_ds = torch.utils.data.TensorDataset(torch.from_numpy(Xva), torch.from_numpy(y[val_idx]))
+    tr_ld = torch.utils.data.DataLoader(tr_ds, batch_size=1024, shuffle=True)
+    va_ld = torch.utils.data.DataLoader(va_ds, batch_size=1024, shuffle=False)
+
+    m = SelectorANNB(in_dim=D2).to(device_)
+    opt = torch.optim.AdamW(m.parameters(), lr=3e-4, weight_decay=1e-4)
+    crit = nn.CrossEntropyLoss(label_smoothing=0.05)
+    best = 1e9
+
+    prog = st.progress(0, text="Training ANN-B...")
+    for epoch in range(1, 16):
+        m.train()
+        tr_loss = 0.0; n = 0
+        for xb, yb in tr_ld:
+            xb, yb = xb.to(device_), yb.to(device_)
+            opt.zero_grad(); _, logits = m(xb); loss = crit(logits, yb)
+            loss.backward(); opt.step()
+            tr_loss += float(loss.item()) * len(xb); n += len(xb)
+        tr_loss /= max(1, n)
+
+        m.eval()
+        with torch.no_grad():
+            va_loss = 0.0; n = 0; acc = 0.0
+            for xb, yb in va_ld:
+                xb, yb = xb.to(device_), yb.to(device_)
+                _, logits = m(xb); loss = crit(logits, yb)
+                va_loss += float(loss.item()) * len(xb); n += len(xb)
+                pred = logits.argmax(dim=1); acc += float((pred==yb).sum().item())
+            va_loss /= max(1, n); acc /= max(1, len(va_ds))
+        prog.progress(int(100*epoch/15), text=f"Training ANN-B... val_loss={va_loss:.4f}, acc={acc:.3f}")
+
+        if va_loss < best:
+            best = va_loss
+            st.session_state.model_b = m
+            st.session_state.meta_b = {
+                "feature_cols": NUMERIC_COLS_ANNB + APP_ONEHOTS,
+                "mean": mean.tolist(), "std": std.tolist(),
+                "augmented": True, "candidate_order": list(st.session_state.cfg.candidates)
+            }
+    prog.empty()
+    st.success("ANN-B trained.")
+
+
+def train_anna(cdf: pd.DataFrame, sdf: pd.DataFrame, device_: torch.device):
+    # Build deltas between best (by net_utility) and current; label = best_row.label_switch_now
+    df = cdf.merge(sdf[["snapshot_id","current_network","hour","weekday","speed_mps","app_class"]], on="snapshot_id", how="left")
+    # optional: include RAG deltas if present in df
+    use_rag = all(col in df.columns for col in ["knn_tput_p50","knn_tput_p90","knn_rtt_p90","knn_loss_mean","knn_p_denial_mean"])
+
+    feats = []
+    labels = []
+    for sid, g in df.groupby("snapshot_id", sort=False):
+        cur = str(g["current_network"].iloc[0])
+        # best by net_utility among available
+        avail = g[g["available"] == 1]
+        if len(avail) == 0:
+            best = g.iloc[0]
+        else:
+            best = avail.sort_values("net_utility", ascending=False).iloc[0]
+        cur_row = g[g["candidate_network"] == cur].iloc[0]
+        feat = {}
+        for c in BASE_DELTA_COLS_ANNA:
+            feat[f"delta_{c}"] = float(best[c]) - float(cur_row[c])
+        if use_rag:
+            for c in RAG_DELTA_COLS_ANNA:
+                feat[f"delta_{c}"] = float(best.get(c, 0.0)) - float(cur_row.get(c, 0.0))
+        feat["switch_outage_ms"] = float(best["switch_outage_ms"])
+        feats.append(feat)
+        labels.append(int(best["label_switch_now"]))
+
+    X = pd.DataFrame(feats).fillna(0.0).astype(np.float32).to_numpy(dtype=np.float32)
+    y = np.array(labels, dtype=np.float32)
+    # train-only norm
+    n = len(y); idx = np.arange(n); np.random.shuffle(idx)
+    nv = max(1, int(0.15*n)); vi = idx[:nv]; ti = idx[nv:]
+    m = X[ti].mean(axis=0); s = X[ti].std(axis=0) + 1e-6
+    Xtr = ((X[ti] - m)/s).astype(np.float32); ytr = y[ti]
+    Xva = ((X[vi] - m)/s).astype(np.float32); yva = y[vi]
+
+    ds_tr = torch.utils.data.TensorDataset(torch.from_numpy(Xtr), torch.from_numpy(ytr))
+    ds_va = torch.utils.data.TensorDataset(torch.from_numpy(Xva), torch.from_numpy(yva))
+    ld_tr = torch.utils.data.DataLoader(ds_tr, batch_size=1024, shuffle=True)
+    ld_va = torch.utils.data.DataLoader(ds_va, batch_size=1024, shuffle=False)
+
+    model = GateANNA(in_dim=X.shape[1], hidden=(128,64), pdrop=0.1).to(device_)
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+    pos = max(1.0, float(ytr.sum()))
+    neg = max(1.0, float(len(ytr) - ytr.sum()))
+    crit = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([neg/pos], dtype=torch.float32, device=device_))
+
+    prog = st.progress(0, text="Training ANN-A...")
+    best = 1e9
+    for epoch in range(1, 16):
+        model.train(); tr_loss = 0.0; nsum=0
+        for xb, yb in ld_tr:
+            xb, yb = xb.to(device_), yb.to(device_)
+            opt.zero_grad(); logit = model(xb); loss = crit(logit, yb)
+            loss.backward(); opt.step()
+            tr_loss += float(loss.item()) * len(xb); nsum += len(xb)
+        tr_loss /= max(1, nsum)
+
+        model.eval()
+        with torch.no_grad():
+            va_loss = 0.0; nsum=0; acc=0.0
+            for xb, yb in ld_va:
+                xb, yb = xb.to(device_), yb.to(device_)
+                logit = model(xb); loss = crit(logit, yb)
+                va_loss += float(loss.item()) * len(xb); nsum += len(xb)
+                pred = (torch.sigmoid(logit) >= 0.5).float()
+                acc += float((pred==yb).sum().item())
+            va_loss /= max(1, nsum); acc /= max(1, len(ds_va))
+        prog.progress(int(100*epoch/15), text=f"Training ANN-A... val_loss={va_loss:.4f}, acc={acc:.3f}")
+        if va_loss < best:
+            best = va_loss
+            st.session_state.model_a = model
+            st.session_state.meta_a = {"feature_cols": list(pd.DataFrame(feats).columns), "mean": m.tolist(), "std": s.tolist(), "threshold": 0.5}
+    prog.empty()
+    st.success("ANN-A trained.")
+
+
+# =========================
+# INFERENCE HELPERS
+# =========================
+def anna_infer_for_snapshot(sid: int) -> Tuple[float, str]:
+    """Return P(switch) and chosen target (best alternative by standalone utility)."""
+    if st.session_state.model_a is None:
+        return -1.0, ""  # indicates not trained
+
+    cand = st.session_state.candidates[st.session_state.candidates["snapshot_id"] == sid]
+    snap = st.session_state.snapshots[st.session_state.snapshots["snapshot_id"] == sid]
+    cur = str(snap["current_network"].iloc[0])
+
+    # choose best alternative by standalone_utility (available != current)
+    alt = cand[(cand["candidate_network"] != cur) & (cand["available"] == 1)]
+    if len(alt) == 0:
+        return 0.0, ""
+
+    tgt = alt.sort_values("standalone_utility", ascending=False).iloc[0]
+    # build feature dict according to meta
+    meta = st.session_state.meta_a
     feat = {}
-    for c in feature_cols_a:
+    # locate cur row
+    cur_row = cand[cand["candidate_network"] == cur].iloc[0]
+    for c in meta["feature_cols"]:
         if c.startswith("delta_"):
             base = c.replace("delta_", "")
-            if base in snap_df.columns:
-                feat[c] = float(tgt[base]) - float(cur[base])
-            else:
-                feat[c] = 0.0
+            feat[c] = float(tgt.get(base, 0.0)) - float(cur_row.get(base, 0.0))
         elif c == "switch_outage_ms":
-            # Penalty to switch TO the target
             feat[c] = float(tgt.get("switch_outage_ms", 0.0))
         else:
-            # Any extra scalars in meta → best-effort fill
             feat[c] = float(tgt.get(c, 0.0))
+    x = np.array([feat[c] for c in meta["feature_cols"]], dtype=np.float32)
+    x = (x - np.array(meta["mean"], dtype=np.float32)) / (np.array(meta["std"], dtype=np.float32) + 1e-6)
+    with torch.no_grad():
+        logit = st.session_state.model_a(torch.from_numpy(x[None, :]).to(device())).item()
+        p = 1.0 / (1.0 + np.exp(-logit))
+    return float(p), str(tgt["candidate_network"])
 
-    x = np.array([feat[c] for c in feature_cols_a], dtype=np.float32)
-    return x, current_network, target_network
 
+def annb_infer_for_snapshot(sid: int) -> Tuple[List[str], np.ndarray]:
+    """Return names and probabilities over present candidates."""
+    if st.session_state.model_b is None:
+        return [], np.array([])
 
-def build_input_b(snap_df: pd.DataFrame, feature_cols_b: list, candidate_order: list[str]) -> tuple[np.ndarray, list[str]]:
-    # Ensure columns exist; missing features are filled with 0
-    for col in feature_cols_b:
-        if col not in snap_df.columns:
-            snap_df[col] = 0.0
-
-    order_map = {c: i for i, c in enumerate(candidate_order)}
-    g = snap_df[snap_df.candidate_network.isin(candidate_order)].sort_values(
-        "candidate_network", key=lambda s: s.map(order_map)
+    df = st.session_state.candidates.merge(
+        st.session_state.snapshots[["snapshot_id","app_class","hour","weekday","speed_mps"]],
+        on="snapshot_id", how="left"
     )
-    X = g[feature_cols_b].to_numpy(dtype=np.float32)  # [2, D]
-    names = list(g["candidate_network"].values)
-    return X, names
+    g = df[df["snapshot_id"] == sid].copy()
 
+    # Build ANN-B features
+    for col in NUMERIC_COLS_ANNB:
+        if col not in g.columns: g[col] = 0.0
+        g[col] = pd.to_numeric(g[col], errors="coerce").fillna(0.0).astype(np.float32)
+    for a in ["bg","map","voip"]:
+        g[f"app_{a}"] = (g["app_class"] == a).astype(np.float32)
 
-def main():
-    ap = argparse.ArgumentParser(description="Run cascaded ANN-A → ANN-B inference.")
-    ap.add_argument("--candidates", default="data/candidates.csv")
-    ap.add_argument("--snapshots",  default="data/snapshots.csv")
-    ap.add_argument("--rag",        default="data/rag_features.csv")
-    ap.add_argument("--model-a",    default="data/ANN-A/ann_a.pt")
-    ap.add_argument("--meta-a",     default="data/ANN-A/ann_a_meta.json")
-    ap.add_argument("--model-b",    default="data/ANN-B/ann_b.pt")
-    ap.add_argument("--meta-b",     default="data/ANN-B/ann_b_meta.json")
-    ap.add_argument("--snapshot-id", type=int, required=True)
-    ap.add_argument("--threshold",   type=float, default=0.5, help="ANN-A probability to trigger switching.")
-    args = ap.parse_args()
+    fcols = st.session_state.meta_b["feature_cols"]
+    X_abs = g[fcols].to_numpy(dtype=np.float32)
+    names = g["candidate_network"].tolist()
 
-    # Load snapshot/candidate slice
-    snap_df = get_snapshot_df(args.snapshot_id, args.candidates, args.snapshots, args.rag)
+    # delta-to-current augmentation if training used it
+    if st.session_state.meta_b.get("augmented", False):
+        cur = str(st.session_state.snapshots[st.session_state.snapshots["snapshot_id"] == sid]["current_network"].iloc[0])
+        cur_row = g[g["candidate_network"] == cur]
+        if len(cur_row) == 0:
+            cur_vec = np.zeros_like(X_abs[0])
+        else:
+            cur_vec = cur_row[fcols].iloc[0].to_numpy(dtype=np.float32)
+        X = np.concatenate([X_abs, X_abs - cur_vec], axis=1)
+    else:
+        X = X_abs
 
-    # ---- Step 1: ANN-A (gate) ----
-    print("\n--- Step 1: ANN-A (switch vs stay) ---")
-    model_a, meta_a = load_model(ANNA, args.model_a, args.meta_a, device)
-    xa, cur_net, tgt_net = build_input_a(snap_df, meta_a["feature_cols"])
-    mean_a = np.array(meta_a["mean"], dtype=np.float32)
-    std_a  = np.array(meta_a["std"], dtype=np.float32)
-    xa_n = (xa - mean_a) / (std_a + 1e-6)
-    with torch.no_grad():
-        logit = model_a(torch.from_numpy(xa_n[None, :]).to(device))
-        p_switch = torch.sigmoid(logit).item()
-    print(f"Current={cur_net}, TargetCandidate={tgt_net}, P(switch)={p_switch:.4f} (thr={args.threshold})")
-
-    if p_switch < args.threshold:
-        print("\nDecision: NO SWITCH (staying on current network).")
-        return
-
-    # ---- Step 2: ANN-B (selector) ----
-    print("\n--- Step 2: ANN-B (choose best target) ---")
-    model_b, meta_b = load_model(ANNB, args.model_b, args.meta_b, device)
-    # ANN-B should not include any penalty columns; use meta_b["feature_cols"] as saved during training
-    Xb, names = build_input_b(snap_df, meta_b["feature_cols"], meta_b.get("candidate_order", ["LTE", "WiFi"]))
-    mean_b = np.array(meta_b["mean"], dtype=np.float32)
-    std_b  = np.array(meta_b["std"], dtype=np.float32)
-    Xb_n = (Xb - mean_b) / (std_b + 1e-6)
-    xt = torch.from_numpy(Xb_n[None, :, :]).to(device)
+    mean = np.array(st.session_state.meta_b["mean"], dtype=np.float32)
+    std  = np.array(st.session_state.meta_b["std"], dtype=np.float32)
+    Xn = (X - mean) / (std + 1e-6)
 
     with torch.no_grad():
-        probs, logits = model_b(xt)
-        p = probs.squeeze(0).detach().cpu().numpy()
-        s = logits.squeeze(0).detach().cpu().numpy()
-    choice = int(p.argmax())
-
-    print("\nProbabilities:")
-    for i, n in enumerate(names):
-        print(f"  {n:5s}  prob={p[i]:.4f}  logit={s[i]:.3f}")
-    print(f"\nFinal recommendation: SWITCH to {names[choice]}")
+        probs, _ = st.session_state.model_b(torch.from_numpy(Xn[None,:,:]).to(device()))
+        p = probs.cpu().numpy()[0]
+    return names, p
 
 
-if __name__ == "__main__":
-    main()
+# =========================
+# LIVE TICK
+# =========================
+def step_once():
+    sid = st.session_state.sid
+    snap, cand = gen_one(st.session_state.cfg, sid)
+
+    # append to buffers
+    st.session_state.snapshots = pd.concat([st.session_state.snapshots, snap], ignore_index=True)
+    st.session_state.candidates = pd.concat([st.session_state.candidates, cand], ignore_index=True)
+
+    # build embeddings + add to vector index
+    emb_rows = build_embedding_rows(cand, snap)
+    add_embeddings_to_index(emb_rows)
+
+    # compute RAG aggregates for the *current* rows and write them back
+    K = st.session_state.cfg.knn_k
+    cand_with_rag = rag_for_rows(cand, K)
+    # overwrite the candidate slice in main df
+    st.session_state.candidates.update(cand_with_rag)
+
+    # ANN-A -> ANN-B pipeline
+    p_switch, target_candidate = anna_infer_for_snapshot(sid)
+    if p_switch < 0:
+        decision = f"Models not trained yet. (heuristics: {'switch' if cand['label_best_network'].iloc[0] != snap['current_network'].iloc[0] else 'stay'})"
+        chosen = snap["current_network"].iloc[0]
+        pvec = None
+    else:
+        thr = st.session_state.meta_a.get("threshold", 0.5)
+        if p_switch >= thr:
+            names, probs = annb_infer_for_snapshot(sid)
+            if len(names) == 0:
+                decision = "Gate: SWITCH, but ANN-B not trained."
+                chosen = target_candidate or "(unknown)"
+                pvec = None
+            else:
+                best_idx = int(np.argmax(probs))
+                chosen = names[best_idx]
+                decision = f"Gate: SWITCH ✅  → Selector: {chosen}"
+                pvec = (names, probs)
+        else:
+            decision = "Gate: NO SWITCH ❌"
+            chosen = snap["current_network"].iloc[0]
+            pvec = None
+
+    # log
+    st.session_state.log.append({
+        "snapshot_id": sid,
+        "timestamp": snap['timestamp'].iloc[0],
+        "current": snap["current_network"].iloc[0],
+        "decision": decision,
+        "chosen": chosen,
+        "p_switch": float(p_switch) if p_switch >= 0 else None
+    })
+
+    st.session_state.sid += 1
+    return snap, cand, decision, pvec
+
+
+# =========================
+# TRAIN BUTTON HANDLER
+# =========================
+def train_both_models():
+    # Compute RAG for all rows first (simple pass)
+    st.info("Preparing RAG features for all buffered rows…")
+    df_all = st.session_state.candidates.copy()
+    # recompute via batches to keep UI responsive
+    batch = 1000
+    for start in range(0, len(df_all), batch):
+        part = df_all.iloc[start:start+batch].copy()
+        part_r = rag_for_rows(part, st.session_state.cfg.knn_k)
+        st.session_state.candidates.update(part_r)
+
+    # Train
+    d = device()
+    train_annb(st.session_state.candidates, st.session_state.snapshots, d)
+    train_anna(st.session_state.candidates, st.session_state.snapshots, d)
+
+
+# =========================
+# UI LAYOUT
+# =========================
+init_state()
+st.title("📶 Smart Switcher — Live Demo")
+st.caption("Live synthetic networking telemetry → FAISS → RAG → ANN-A (gate) → ANN-B (selector)")
+
+with st.sidebar:
+    st.subheader("Controls")
+    run = st.toggle("Live stream", value=st.session_state.running, help="Toggle live data generation.")
+    st.session_state.running = run
+    interval_ms = st.slider("Stream interval (ms)", 300, 3000, 1200, 100)
+    k_val = st.slider("RAG k (neighbors)", 10, 200, st.session_state.cfg.knn_k, 10)
+    st.session_state.cfg.knn_k = int(k_val)
+    thr = st.slider("ANN-A switch threshold", 0.05, 0.95, float(st.session_state.meta_a["threshold"]) if st.session_state.meta_a else 0.5, 0.01)
+
+    st.divider()
+    if st.button("🧠 Train Models (pause stream)"):
+        st.session_state.running = False
+        train_both_models()
+
+    st.divider()
+    st.markdown("**Status**")
+    st.write(f"FAISS available: {'✅' if HAVE_FAISS else '⚠️ NumPy fallback'}")
+    st.write(f"ANN-A: {'✅' if st.session_state.model_a is not None else '—'}  |  ANN-B: {'✅' if st.session_state.model_b is not None else '—'}")
+    st.write(f"Buffered snapshots: {len(st.session_state.snapshots)}")
+
+# Live area
+col1, col2 = st.columns([1.3, 1])
+
+with col1:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("Live Snapshot")
+    if st.session_state.running:
+        # do one step and immediately rerun after sleep
+        snap, cand, decision, pvec = step_once()
+    elif st.button("➕ Step once"):
+        snap, cand, decision, pvec = step_once()
+    elif len(st.session_state.snapshots) > 0:
+        sid_show = st.session_state.sid - 1
+        snap = st.session_state.snapshots[st.session_state.snapshots["snapshot_id"] == sid_show]
+        cand = st.session_state.candidates[st.session_state.candidates["snapshot_id"] == sid_show]
+        decision = st.session_state.log[-1]["decision"] if st.session_state.log else "—"
+        pvec = None
+    else:
+        snap, cand, decision, pvec = None, None, "—", None
+
+    if snap is not None:
+        srow = snap.iloc[0]
+        st.markdown(f"<div class='big-metric'>snapshot_id={int(srow.snapshot_id)} · {srow.timestamp}</div>", unsafe_allow_html=True)
+        st.markdown(f"<span class='badge'>current: {srow.current_network}</span>", unsafe_allow_html=True)
+        st.markdown(f"<div class='small-muted'>lat={srow.lat:.5f}, lon={srow.lon:.5f} · speed={srow.speed_mps:.1f} m/s · app={srow.app_class}</div>", unsafe_allow_html=True)
+        st.write("")
+        # Candidate table preview
+        show_cols = ["candidate_network","available","tput_dl_mbps","rtt_ms","loss_rate","switch_outage_ms","net_utility","label_switch_now"]
+        st.dataframe(cand[show_cols].round(3), use_container_width=True, hide_index=True)
+
+        st.markdown(f"**Decision:** {decision}")
+        if pvec is not None:
+            names, probs = pvec
+            dfp = pd.DataFrame({"network": names, "prob": probs})
+            st.bar_chart(dfp.set_index("network"))
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+with col2:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("Recent Decisions")
+    if len(st.session_state.log) > 0:
+        st.table(pd.DataFrame(st.session_state.log[-12:]).iloc[::-1])
+    else:
+        st.write("—")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# simple auto-refresh loop
+if st.session_state.running:
+    time.sleep(interval_ms / 1000.0)
+    st.experimental_rerun()
